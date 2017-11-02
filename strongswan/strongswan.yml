@@ -1,0 +1,191 @@
+
+heat_template_version: 2015-04-30
+
+description: Deploy a Strongswan VPN endpoint
+
+parameters:
+  private-network:
+    description: The network you want the VPN to give you access to
+    label: Private network
+    type: string
+    constraints:
+      - custom_constraint: neutron.network
+  public-network:
+    description: The network where your floating IP lives
+    label: Public network
+    type: string
+    default: external_network
+  vpn_user:
+    description: VPN Username
+    label: User
+    type: string
+  vpn_password:
+    description: VPN Password
+    label: Password
+    type: string
+    hidden: true
+  flavor:
+    description: The flavor for the VPN's VM
+    label: Flavor
+    type: string
+    constraints:
+      - custom_constraint: nova.flavor
+  image:
+    description: The image for the VPN's VM
+    label: Image
+    type: string
+    constraints:
+      - custom_constraint: glance.image
+  key_name:
+    type: string
+    label: Keypair Name
+    description: Name of a KeyPair to enable SSH access to the instance.
+    constraints:
+      - custom_constraint: nova.keypair
+      
+resources:
+  setup_strongswan:
+    type: OS::Heat::SoftwareConfig
+    properties:
+      config:
+        str_replace:
+          template: |
+            #!/bin/sh
+            echo "net.ipv4.ip_forward = 1" >> /etc/sysctl.conf
+            sysctl -p /etc/sysctl.conf
+            iptables -t nat -I POSTROUTING -j MASQUERADE
+            dhclient
+            apt-get -y install strongswan
+            cat > /etc/ipsec.conf << EOF
+            config setup
+              uniqueids=no
+
+            conn %default
+              ikelifetime=60m
+              keylife=20m
+              rekeymargin=3m
+              keyingtries=1
+              keyexchange=ikev2
+              authby=secret
+
+            conn nat-t
+              left=%defaultroute
+              leftsubnet=$cidr
+              leftfirewall=yes
+              right=%any
+              rightsubnet=0.0.0.0/0
+              auto=start
+            EOF
+
+            echo '$secrets' > /etc/ipsec.secrets
+            chmod 600 /etc/ipsec.secrets
+            ipsec restart
+          params:
+            $cidr:   { get_attr: [ vpngw_port, subnets, 0, cidr ] }
+            $user:   { get_param: vpn_user }
+            $secret: { get_attr: [ vpn_secrets, value ] }
+
+  do_client_config:
+    type: OS::Heat::Value
+    properties:
+      value:
+        str_replace:
+          template: |
+            config setup
+              # strictcrlpolicy=yes
+              charondebug="ike 4, knl 4, cfg 4"
+              # uniqueids = no
+
+            conn %default
+              ikelifetime=60m
+              keylife=20m
+              rekeymargin=3m
+              keyingtries=1
+              keyexchange=ikev2
+              authby=secret
+
+            conn nat-t
+              left=$defaultroute
+              leftfirewall=yes
+              rightid=$user
+              right=$floating_ip
+              rightsubnet=$cidr
+              auto=start
+
+          params:
+            $cidr: {get_attr: [vpngw_port, subnets, 0, cidr]}
+            $user: {get_param: vpn_user}
+            $floating_ip: {get_attr: [vpngw_public_ip, floating_ip_address] }
+
+  vpn_secrets:
+    type: OS::Heat::Value
+    properties:
+      value:
+        str_replace:
+          template: |
+            user : PSK "pass"
+
+          params:
+            user: { get_param: vpn_user }
+            pass: { get_param: vpn_password }
+
+  vpngw_port:
+    type: OS::Neutron::Port
+    properties:
+      network: {get_param: private-network}
+      security_groups: [{ get_resource: secgroup_strongswan}, {get_resource: secgroup_ssh} ]
+
+  secgroup_strongswan:
+    type: OS::Neutron::SecurityGroup
+    properties:
+      description: Enable traffic external traffic on UDP ports 500 and 4500 for strongswan tunnels.
+      rules: [
+        {remote_ip_prefix: 0.0.0.0/0,
+        protocol: udp,
+        port_range_max: 500,
+        port_range_min: 500},
+        {remote_ip_prefix: 0.0.0.0/0,
+        protocol: udp,
+        port_range_max: 4500,
+        port_range_min: 4500}]
+
+  secgroup_ssh:
+    type: OS::Neutron::SecurityGroup
+    properties:
+      description: Allow SSH access to VPN host
+      rules: [
+        {remote_ip_prefix: 0.0.0.0/0,
+        protocol: tcp,
+        port_range_max: 22,
+        port_range_min: 22}]
+
+  vpngw:
+    type: OS::Nova::Server
+    properties:
+      image: {get_param: image}
+      flavor: {get_param: flavor}
+      key_name: { get_param: key_name }
+      user_data_format: RAW
+      user_data: {get_resource: setup_strongswan}
+      networks:
+        - port: {get_resource: vpngw_port}
+
+  vpngw_public_ip:
+    type: OS::Neutron::FloatingIP
+    properties:
+      floating_network: {get_param: public-network}
+
+  fip_association:
+    type: OS::Neutron::FloatingIPAssociation
+    properties:
+      floatingip_id: {get_resource: vpngw_public_ip}
+      port_id: {get_resource: vpngw_port}
+
+outputs:
+  client config:
+    description: StrongSwan client configuration (usually /etc/ipsec.conf)
+    value: { get_attr: [ do_client_config, value ] }
+
+  client secrets:
+    description: StrongSwan client secret file content (usually /etc/ipsec.secrets)
+    value: { get_attr: [ vpn_secrets, value ] }
